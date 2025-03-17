@@ -1,0 +1,68 @@
+# File Synchronization Service
+
+A Windows Service that automatically synchronizes files between two Windows machines using socket communication and a folder watcher.
+
+## Features
+✅ Auto-starts on system boot  
+✅ Monitors `C:/sample` folder for new files  
+✅ Securely transfers files between two machines  
+✅ Prevents infinite file transfer loops  
+✅ Runs as a background Windows Service  
+
+---
+
+## Prerequisites
+Ensure the following are installed:
+- Python 3.8 or higher
+- `watchdog` library
+- `pywin32` library
+
+Install dependencies with:
+```bash
+pip install watchdog pywin32
+```
+
+---
+
+## Installation
+1. Copy the script to your machine.
+2. Update these configurations in the script:
+   - `REMOTE_IP = "<Other Machine's IP>"`
+   - `REMOTE_PORT = 5000`  
+   - `LOCAL_PORT = 5000`  
+3. Run the following command to install the service:
+```powershell
+python file_sync_service.py install
+```
+4. Start the service:
+```powershell
+python file_sync_service.py start
+```
+5. To stop the service:
+```powershell
+python file_sync_service.py stop
+```
+
+---
+
+## File Transfer Details
+- Files added by external programs to `C:/sample` are automatically transferred to the other machine.
+- Files transferred from one machine to the other will not be re-sent, preventing infinite loops.
+
+---
+
+## Troubleshooting
+- Check the Windows Event Viewer for service logs under **Application Logs**.
+- Ensure firewall rules allow traffic on port 5000 (or your chosen port).
+- Confirm both machines have the correct `REMOTE_IP` settings.
+
+---
+
+## License
+This project is licensed under the MIT License.
+
+---
+
+## Contributors
+💻 Developed by eyobed101
+

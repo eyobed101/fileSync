@@ -19,7 +19,7 @@ import uuid
 
 # Configuration
 WATCH_FOLDER = "C:/sample"  # Change this to your sync folder
-REMOTE_IP = "192.168.137.75"  # Other machine's IP
+REMOTE_IP = "192.168.137.1"  # Other machine's IP
 REMOTE_PORT = 5000
 LOCAL_PORT = 5000
 RETRY_COUNT = 5
@@ -28,10 +28,25 @@ SYNC_INTERVAL = 5  # Seconds between full sync checks
 BLOCK_SIZE = 128 * 1024  # 128KB blocks like Syncthing
 MAX_CONNECTION_ATTEMPTS = 5
 DEVICE_ID = str(uuid.uuid4())  # Unique identifier for this device
+LOCAL_CHANGE_EXPIRE = 10  # Seconds to remember local changes
 
 # Track file versions and origins
 file_versions = defaultdict(dict)
 version_file = os.path.join(WATCH_FOLDER, ".sync_versions.json")
+
+def get_file_content_hash(filepath):
+    """Generate SHA-256 hash of the entire file content"""
+    if not os.path.isfile(filepath):
+        return None
+    
+    sha256 = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            block = f.read(BLOCK_SIZE)
+            if not block:
+                break
+            sha256.update(block)
+    return sha256.hexdigest()
 
 def load_versions():
     global file_versions
@@ -69,8 +84,15 @@ def get_file_blocks(filepath):
 
 def get_file_version(filepath):
     """Generate a version vector for the file"""
+    if not os.path.exists(filepath):
+        return None
+        
     if os.path.isdir(filepath):
-        return {"type": "directory"}
+        return {
+            "type": "directory",
+            "device": DEVICE_ID,
+            "version": time.time_ns()
+        }
         
     stat = os.stat(filepath)
     return {
@@ -78,6 +100,7 @@ def get_file_version(filepath):
         "size": stat.st_size,
         "mtime": stat.st_mtime_ns,
         "blocks": get_file_blocks(filepath),
+        "content_hash": get_file_content_hash(filepath),
         "device": DEVICE_ID,
         "version": time.time_ns()
     }
@@ -88,6 +111,7 @@ class SyncHandler(FileSystemEventHandler):
         self.last_sync = 0
         self.pending_changes = set()
         self.lock = threading.Lock()
+        self.local_changes = {}  # Track changes we initiated locally {path: {hash, timestamp}}
 
     def should_ignore(self, path):
         return any(ignore in path for ignore in self.ignore_patterns)
@@ -111,13 +135,34 @@ class SyncHandler(FileSystemEventHandler):
 
     def queue_change(self, file_path):
         with self.lock:
-            self.pending_changes.add(file_path)
-        threading.Thread(target=self.process_changes).start()
+            if not self.is_local_change(file_path):
+                self.pending_changes.add(file_path)
+                threading.Thread(target=self.process_changes).start()
 
     def queue_delete(self, file_path):
         with self.lock:
-            self.pending_changes.add(("delete", file_path))
-        threading.Thread(target=self.process_changes).start()
+            if not self.is_local_change(file_path):
+                self.pending_changes.add(("delete", file_path))
+                threading.Thread(target=self.process_changes).start()
+
+    def is_local_change(self, file_path):
+        """Check if this change was initiated locally"""
+        with self.lock:
+            # Clean up expired local changes
+            now = time.time()
+            self.local_changes = {k: v for k, v in self.local_changes.items() 
+                                if now - v['timestamp'] < LOCAL_CHANGE_EXPIRE}
+            
+            return file_path in self.local_changes
+
+    def mark_local_change(self, file_path):
+        """Mark a file as changed locally to prevent echo"""
+        with self.lock:
+            content_hash = get_file_content_hash(file_path) if os.path.isfile(file_path) else None
+            self.local_changes[file_path] = {
+                'hash': content_hash,
+                'timestamp': time.time()
+            }
 
     def process_changes(self):
         with self.lock:
@@ -145,6 +190,12 @@ class SyncHandler(FileSystemEventHandler):
 
     def handle_delete(self, file_path):
         file_name = os.path.relpath(file_path, WATCH_FOLDER)
+        file_key = f"{DEVICE_ID}:{file_name}"
+        
+        # Only send delete if we have a record of this file
+        if file_key not in file_versions:
+            return
+            
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(10)
@@ -156,6 +207,10 @@ class SyncHandler(FileSystemEventHandler):
                     "version": time.time_ns()
                 }
                 self._send_message(s, message)
+                
+                # Mark as local change to prevent echo
+                self.mark_local_change(file_path)
+                
         except Exception as e:
             print(f"Error sending delete command: {e}")
 
@@ -179,9 +234,21 @@ class SyncHandler(FileSystemEventHandler):
         current_version = get_file_version(file_path)
         file_key = f"{DEVICE_ID}:{file_name}"
 
-        # Check if we already have the latest version
-        if file_key in file_versions and file_versions[file_key]["version"] >= current_version["version"]:
-            return
+        # Enhanced version and content check
+        if file_key in file_versions:
+            existing_version = file_versions[file_key]
+            
+            # Skip if version is newer or equal AND content is identical
+            if (existing_version.get("version", 0) >= current_version["version"] and 
+                existing_version.get("content_hash") == current_version.get("content_hash")):
+                return
+                
+            # Skip if content is identical regardless of version
+            if existing_version.get("content_hash") == current_version.get("content_hash"):
+                # Update version only if content is same but version was older
+                file_versions[file_key] = current_version
+                save_versions()
+                return
 
         attempt = 0
         while attempt < RETRY_COUNT:
@@ -196,7 +263,8 @@ class SyncHandler(FileSystemEventHandler):
                         "action": "sync",
                         "path": file_name,
                         "version": current_version,
-                        "device": DEVICE_ID
+                        "device": DEVICE_ID,
+                        "content_hash": current_version.get("content_hash")
                     }
                     self._send_message(s, metadata)
                     
@@ -216,9 +284,11 @@ class SyncHandler(FileSystemEventHandler):
                 # Update version after successful transfer
                 file_versions[file_key] = current_version
                 save_versions()
+                
+                # Mark as local change to prevent echo
+                self.mark_local_change(file_path)
+                
                 return
-            except Exception as e:
-                print(f"Error sending {file_name}: {e}")
             except Exception as e:
                 attempt += 1
                 print(f"Error sending {file_name} (attempt {attempt}): {e}")
@@ -246,7 +316,7 @@ def receive_connection(conn, addr):
             
             # Only delete if the incoming version is newer
             if file_key in file_versions:
-                if file_versions[file_key]["version"] >= metadata["version"]:
+                if file_versions[file_key].get("version", 0) >= metadata["version"]:
                     return
             
             if os.path.exists(target_path):
@@ -263,42 +333,67 @@ def receive_connection(conn, addr):
             save_versions()
             return
             
-        file_path = os.path.join(WATCH_FOLDER, metadata["path"])
-        file_key = f"{metadata['device']}:{metadata['path']}"
-        
-        # Check if we already have this version
-        if file_key in file_versions and file_versions[file_key]["version"] >= metadata["version"]["version"]:
-            return
+        if metadata["action"] == "sync":
+            file_path = os.path.join(WATCH_FOLDER, metadata["path"])
+            file_key = f"{metadata['device']}:{metadata['path']}"
             
-        if metadata["version"]["type"] == "directory":
-            os.makedirs(file_path, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, 'wb') as f:
-                while True:
-                    block_size_data = conn.recv(4)
-                    if not block_size_data:
-                        break
-                    block_size = struct.unpack('!I', block_size_data)[0]
-                    if block_size == 0:
-                        break  # End of file marker
+            # Enhanced conflict resolution
+            if file_key in file_versions:
+                local_version = file_versions[file_key]
+                
+                # If content is identical, just update version
+                if (local_version.get("content_hash") == metadata["version"].get("content_hash") and
+                    local_version.get("device") != metadata["device"]):
+                    file_versions[file_key] = metadata["version"]
+                    save_versions()
+                    return
+                
+                # If remote version is older, skip
+                if local_version.get("version", 0) > metadata["version"]["version"]:
+                    return
                     
-                    # Read block
-                    received = 0
-                    block = bytearray()
-                    while received < block_size:
-                        chunk = conn.recv(min(block_size - received, 4096))
-                        if not chunk:
-                            raise ConnectionError("Incomplete block received")
-                        block.extend(chunk)
-                        received += len(chunk)
-                    f.write(block)
-                    
-        # Update version after successful transfer
-        file_versions[file_key] = metadata["version"]
-        save_versions()
-        
-        print(f"Received: {metadata['path']}")
+                # If versions are equal but different content, implement conflict resolution
+                if (local_version.get("version", 0) == metadata["version"]["version"] and
+                    local_version.get("content_hash") != metadata["version"].get("content_hash")):
+                    # Conflict resolution: append device ID to filename
+                    base, ext = os.path.splitext(metadata["path"])
+                    conflict_path = f"{base}_{metadata['device']}{ext}"
+                    file_path = os.path.join(WATCH_FOLDER, conflict_path)
+                    print(f"Conflict detected, saving as: {conflict_path}")
+            
+            # Mark as remote change to prevent echo
+            handler = SyncHandler()
+            handler.mark_local_change(file_path)
+            
+            if metadata["version"]["type"] == "directory":
+                os.makedirs(file_path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, 'wb') as f:
+                    while True:
+                        block_size_data = conn.recv(4)
+                        if not block_size_data:
+                            break
+                        block_size = struct.unpack('!I', block_size_data)[0]
+                        if block_size == 0:
+                            break  # End of file marker
+                        
+                        # Read block
+                        received = 0
+                        block = bytearray()
+                        while received < block_size:
+                            chunk = conn.recv(min(block_size - received, 4096))
+                            if not chunk:
+                                raise ConnectionError("Incomplete block received")
+                            block.extend(chunk)
+                            received += len(chunk)
+                        f.write(block)
+                        
+            # Update version after successful transfer
+            file_versions[file_key] = metadata["version"]
+            save_versions()
+            
+            print(f"Received: {metadata['path']}")
     except Exception as e:
         print(f"Error handling connection: {e}")
     finally:

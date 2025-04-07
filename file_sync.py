@@ -18,14 +18,14 @@ from collections import defaultdict
 import uuid
 
 # Configuration
-WATCH_FOLDER = "C:/sample"  # Change this to your sync folder
+WATCH_FOLDER = "C:/sample"  # Root folder to watch
 REMOTE_IP = "192.168.137.1"  # Other machine's IP
 REMOTE_PORT = 5000
 LOCAL_PORT = 5000
 RETRY_COUNT = 5
 RETRY_DELAY = 2
 SYNC_INTERVAL = 5  # Seconds between full sync checks
-BLOCK_SIZE = 128 * 1024  # 128KB blocks like Syncthing
+BLOCK_SIZE = 128 * 1024  # 128KB blocks
 MAX_CONNECTION_ATTEMPTS = 5
 DEVICE_ID = str(uuid.uuid4())  # Unique identifier for this device
 LOCAL_CHANGE_EXPIRE = 10  # Seconds to remember local changes
@@ -68,7 +68,7 @@ def save_versions():
         print(f"Error saving versions: {e}")
 
 def get_file_blocks(filepath):
-    """Generate block hashes for a file (similar to Syncthing's block protocol)"""
+    """Generate block hashes for a file"""
     block_hashes = []
     if not os.path.isfile(filepath):
         return block_hashes
@@ -105,6 +105,12 @@ def get_file_version(filepath):
         "version": time.time_ns()
     }
 
+def ensure_directory_exists(full_path):
+    """Ensure all parent directories exist for a file path"""
+    dir_path = os.path.dirname(full_path)
+    if dir_path and not os.path.exists(dir_path):
+        os.makedirs(dir_path, exist_ok=True)
+
 class SyncHandler(FileSystemEventHandler):
     def __init__(self):
         self.ignore_patterns = ['.sync_versions.json']
@@ -122,7 +128,10 @@ class SyncHandler(FileSystemEventHandler):
 
     def on_created(self, event):
         if not self.should_ignore(event.src_path):
-            self.queue_change(event.src_path)
+            if event.is_directory:
+                self.sync_directory(event.src_path)
+            else:
+                self.queue_change(event.src_path)
 
     def on_deleted(self, event):
         if not self.should_ignore(event.src_path):
@@ -130,7 +139,10 @@ class SyncHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         if not self.should_ignore(event.dest_path):
-            self.queue_change(event.dest_path)
+            if event.is_directory:
+                self.sync_directory(event.dest_path)
+            else:
+                self.queue_change(event.dest_path)
             self.queue_delete(event.src_path)
 
     def queue_change(self, file_path):
@@ -215,11 +227,56 @@ class SyncHandler(FileSystemEventHandler):
             print(f"Error sending delete command: {e}")
 
     def sync_directory(self, dir_path):
+        """Sync an entire directory structure"""
         for root, dirs, files in os.walk(dir_path):
+            # First ensure all directories exist
+            for dir_name in dirs:
+                full_dir_path = os.path.join(root, dir_name)
+                if not self.should_ignore(full_dir_path):
+                    rel_dir_path = os.path.relpath(full_dir_path, WATCH_FOLDER)
+                    self._sync_directory_metadata(rel_dir_path)
+            
+            # Then sync all files
             for file in files:
                 file_path = os.path.join(root, file)
                 if not self.should_ignore(file_path):
                     self.send_file(file_path)
+
+    def _sync_directory_metadata(self, rel_dir_path):
+        """Sync directory creation/metadata"""
+        dir_key = f"{DEVICE_ID}:{rel_dir_path}"
+        current_version = {
+            "type": "directory",
+            "device": DEVICE_ID,
+            "version": time.time_ns()
+        }
+        
+        # Check if we already have the latest version
+        if dir_key in file_versions and file_versions[dir_key].get("version", 0) >= current_version["version"]:
+            return
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
+                s.connect((REMOTE_IP, REMOTE_PORT))
+                message = {
+                    "action": "sync",
+                    "path": rel_dir_path,
+                    "version": current_version,
+                    "device": DEVICE_ID
+                }
+                self._send_message(s, message)
+                
+                # Update version after successful transfer
+                file_versions[dir_key] = current_version
+                save_versions()
+                
+                # Mark as local change to prevent echo
+                full_dir_path = os.path.join(WATCH_FOLDER, rel_dir_path)
+                self.mark_local_change(full_dir_path)
+                
+        except Exception as e:
+            print(f"Error syncing directory {rel_dir_path}: {e}")
 
     def _send_message(self, sock, message):
         """Send a message with length prefix"""
@@ -368,7 +425,8 @@ def receive_connection(conn, addr):
             if metadata["version"]["type"] == "directory":
                 os.makedirs(file_path, exist_ok=True)
             else:
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                # Ensure parent directories exist
+                ensure_directory_exists(file_path)
                 with open(file_path, 'wb') as f:
                     while True:
                         block_size_data = conn.recv(4)

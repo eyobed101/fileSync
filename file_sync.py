@@ -13,91 +13,149 @@ import win32event
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import sys
+import struct
+from collections import defaultdict
+import uuid
 
 # Configuration
 WATCH_FOLDER = "C:/sample"  # Change this to your sync folder
-REMOTE_IP = "192.168.137.75"      # Other machine's IP
+REMOTE_IP = "192.168.137.75"  # Other machine's IP
 REMOTE_PORT = 5000
 LOCAL_PORT = 5000
 RETRY_COUNT = 5
 RETRY_DELAY = 2
 SYNC_INTERVAL = 5  # Seconds between full sync checks
+BLOCK_SIZE = 128 * 1024  # 128KB blocks like Syncthing
+MAX_CONNECTION_ATTEMPTS = 5
+DEVICE_ID = str(uuid.uuid4())  # Unique identifier for this device
 
-# Track file origins to prevent loops
-file_origins = {}
-origin_file = os.path.join(WATCH_FOLDER, ".sync_origins.json")
+# Track file versions and origins
+file_versions = defaultdict(dict)
+version_file = os.path.join(WATCH_FOLDER, ".sync_versions.json")
 
-def load_origins():
-    global file_origins
+def load_versions():
+    global file_versions
     try:
-        if os.path.exists(origin_file):
-            with open(origin_file, 'r') as f:
-                file_origins = json.load(f)
+        if os.path.exists(version_file):
+            with open(version_file, 'r', encoding='utf-8') as f:
+                file_versions = json.load(f)
     except Exception as e:
-        print(f"Error loading origins: {e}")
+        print(f"Error loading versions: {e}")
+        file_versions = defaultdict(dict)
 
-def save_origins():
+def save_versions():
     try:
-        with open(origin_file, 'w') as f:
-            json.dump(file_origins, f)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tf:
+            json.dump(file_versions, tf)
+        # Atomic rename
+        os.replace(tf.name, version_file)
     except Exception as e:
-        print(f"Error saving origins: {e}")
+        print(f"Error saving versions: {e}")
 
-def get_file_hash(filepath):
-    """Generate MD5 hash of file contents"""
-    hash_md5 = hashlib.md5()
+def get_file_blocks(filepath):
+    """Generate block hashes for a file (similar to Syncthing's block protocol)"""
+    block_hashes = []
+    if not os.path.isfile(filepath):
+        return block_hashes
+        
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+        while True:
+            block = f.read(BLOCK_SIZE)
+            if not block:
+                break
+            block_hash = hashlib.sha256(block).hexdigest()
+            block_hashes.append(block_hash)
+    return block_hashes
+
+def get_file_version(filepath):
+    """Generate a version vector for the file"""
+    if os.path.isdir(filepath):
+        return {"type": "directory"}
+        
+    stat = os.stat(filepath)
+    return {
+        "type": "file",
+        "size": stat.st_size,
+        "mtime": stat.st_mtime_ns,
+        "blocks": get_file_blocks(filepath),
+        "device": DEVICE_ID,
+        "version": time.time_ns()
+    }
 
 class SyncHandler(FileSystemEventHandler):
     def __init__(self):
-        self.ignore_patterns = ['.sync_origins.json']
+        self.ignore_patterns = ['.sync_versions.json']
         self.last_sync = 0
+        self.pending_changes = set()
+        self.lock = threading.Lock()
 
     def should_ignore(self, path):
         return any(ignore in path for ignore in self.ignore_patterns)
 
     def on_modified(self, event):
         if not event.is_directory and not self.should_ignore(event.src_path):
-            self.handle_change(event.src_path)
+            self.queue_change(event.src_path)
 
     def on_created(self, event):
         if not self.should_ignore(event.src_path):
-            self.handle_change(event.src_path)
+            self.queue_change(event.src_path)
 
     def on_deleted(self, event):
         if not self.should_ignore(event.src_path):
-            self.handle_delete(event.src_path)
+            self.queue_delete(event.src_path)
 
     def on_moved(self, event):
         if not self.should_ignore(event.dest_path):
-            self.handle_change(event.dest_path)
-            self.handle_delete(event.src_path)
+            self.queue_change(event.dest_path)
+            self.queue_delete(event.src_path)
+
+    def queue_change(self, file_path):
+        with self.lock:
+            self.pending_changes.add(file_path)
+        threading.Thread(target=self.process_changes).start()
+
+    def queue_delete(self, file_path):
+        with self.lock:
+            self.pending_changes.add(("delete", file_path))
+        threading.Thread(target=self.process_changes).start()
+
+    def process_changes(self):
+        with self.lock:
+            if not self.pending_changes:
+                return
+            changes = self.pending_changes.copy()
+            self.pending_changes.clear()
+            
+        for change in changes:
+            if isinstance(change, tuple) and change[0] == "delete":
+                self.handle_delete(change[1])
+            else:
+                self.handle_change(change if not isinstance(change, tuple) else change[1])
 
     def handle_change(self, file_path):
-        if time.time() - self.last_sync < 1:  # Prevent rapid sync
+        current_time = time.time()
+        if current_time - self.last_sync < 1:  # Prevent rapid sync
             return
-            
-        if file_path in file_origins and file_origins[file_path] == "remote":
-            return  # Skip files we received from remote
             
         if os.path.isdir(file_path):
             self.sync_directory(file_path)
         else:
             self.send_file(file_path)
-        self.last_sync = time.time()
+        self.last_sync = current_time
 
     def handle_delete(self, file_path):
-        if file_path in file_origins and file_origins[file_path] == "remote":
-            return
-            
         file_name = os.path.relpath(file_path, WATCH_FOLDER)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
                 s.connect((REMOTE_IP, REMOTE_PORT))
-                s.sendall(json.dumps({"action": "delete", "path": file_name}).encode())
+                message = {
+                    "action": "delete",
+                    "path": file_name,
+                    "device": DEVICE_ID,
+                    "version": time.time_ns()
+                }
+                self._send_message(s, message)
         except Exception as e:
             print(f"Error sending delete command: {e}")
 
@@ -108,42 +166,59 @@ class SyncHandler(FileSystemEventHandler):
                 if not self.should_ignore(file_path):
                     self.send_file(file_path)
 
+    def _send_message(self, sock, message):
+        """Send a message with length prefix"""
+        data = json.dumps(message).encode('utf-8')
+        sock.sendall(struct.pack('!I', len(data)) + data)
+
     def send_file(self, file_path):
         if not os.path.exists(file_path):
             return
             
         file_name = os.path.relpath(file_path, WATCH_FOLDER)
-        file_hash = get_file_hash(file_path) if os.path.isfile(file_path) else "dir"
+        current_version = get_file_version(file_path)
+        file_key = f"{DEVICE_ID}:{file_name}"
 
-        if file_path in file_origins and file_origins[file_path] == file_hash:
-            return  # File hasn't changed
+        # Check if we already have the latest version
+        if file_key in file_versions and file_versions[file_key]["version"] >= current_version["version"]:
+            return
 
         attempt = 0
         while attempt < RETRY_COUNT:
             try:
                 print(f"Sending: {file_name}")
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(10)
+                    s.settimeout(30)
                     s.connect((REMOTE_IP, REMOTE_PORT))
                     
                     # Send metadata first
                     metadata = {
                         "action": "sync",
                         "path": file_name,
-                        "hash": file_hash,
-                        "is_dir": os.path.isdir(file_path)
+                        "version": current_version,
+                        "device": DEVICE_ID
                     }
-                    s.sendall(json.dumps(metadata).encode())
+                    self._send_message(s, metadata)
                     
                     # Send file content if not directory
                     if os.path.isfile(file_path):
                         with open(file_path, 'rb') as f:
-                            while chunk := f.read(4096):
-                                s.sendall(chunk)
+                            while True:
+                                block = f.read(BLOCK_SIZE)
+                                if not block:
+                                    break
+                                s.sendall(struct.pack('!I', len(block)))  # Block size prefix
+                                s.sendall(block)
                                 
-                file_origins[file_path] = "local"
-                save_origins()
+                        # Send end marker
+                        s.sendall(struct.pack('!I', 0))
+                                
+                # Update version after successful transfer
+                file_versions[file_key] = current_version
+                save_versions()
                 return
+            except Exception as e:
+                print(f"Error sending {file_name}: {e}")
             except Exception as e:
                 attempt += 1
                 print(f"Error sending {file_name} (attempt {attempt}): {e}")
@@ -152,46 +227,86 @@ class SyncHandler(FileSystemEventHandler):
 
 def receive_connection(conn, addr):
     try:
-        data = conn.recv(4096).decode()
-        metadata = json.loads(data)
+        # Read message length
+        raw_msglen = conn.recv(4)
+        if not raw_msglen:
+            return
+        msglen = struct.unpack('!I', raw_msglen)[0]
+        
+        # Read message data
+        data = conn.recv(msglen)
+        if len(data) != msglen:
+            raise ValueError("Incomplete message received")
+            
+        metadata = json.loads(data.decode('utf-8'))
         
         if metadata["action"] == "delete":
             target_path = os.path.join(WATCH_FOLDER, metadata["path"])
+            file_key = f"{metadata['device']}:{metadata['path']}"
+            
+            # Only delete if the incoming version is newer
+            if file_key in file_versions:
+                if file_versions[file_key]["version"] >= metadata["version"]:
+                    return
+            
             if os.path.exists(target_path):
                 if os.path.isdir(target_path):
                     shutil.rmtree(target_path)
                 else:
                     os.remove(target_path)
-                if target_path in file_origins:
-                    del file_origins[target_path]
+            
+            file_versions[file_key] = {
+                "device": metadata["device"],
+                "version": metadata["version"],
+                "deleted": True
+            }
+            save_versions()
             return
             
         file_path = os.path.join(WATCH_FOLDER, metadata["path"])
-        file_dir = os.path.dirname(file_path)
+        file_key = f"{metadata['device']}:{metadata['path']}"
         
-        # Mark as remote origin before processing to prevent loops
-        file_origins[file_path] = "remote"
-        save_origins()
-        
-        if metadata["is_dir"]:
+        # Check if we already have this version
+        if file_key in file_versions and file_versions[file_key]["version"] >= metadata["version"]["version"]:
+            return
+            
+        if metadata["version"]["type"] == "directory":
             os.makedirs(file_path, exist_ok=True)
         else:
-            os.makedirs(file_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, 'wb') as f:
-                while chunk := conn.recv(4096):
-                    f.write(chunk)
+                while True:
+                    block_size_data = conn.recv(4)
+                    if not block_size_data:
+                        break
+                    block_size = struct.unpack('!I', block_size_data)[0]
+                    if block_size == 0:
+                        break  # End of file marker
                     
-        # Update hash after successful transfer
-        if not metadata["is_dir"]:
-            file_origins[file_path] = metadata["hash"]
-            save_origins()
-            
+                    # Read block
+                    received = 0
+                    block = bytearray()
+                    while received < block_size:
+                        chunk = conn.recv(min(block_size - received, 4096))
+                        if not chunk:
+                            raise ConnectionError("Incomplete block received")
+                        block.extend(chunk)
+                        received += len(chunk)
+                    f.write(block)
+                    
+        # Update version after successful transfer
+        file_versions[file_key] = metadata["version"]
+        save_versions()
+        
         print(f"Received: {metadata['path']}")
     except Exception as e:
         print(f"Error handling connection: {e}")
+    finally:
+        conn.close()
 
 def receive_server(stop_event):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.settimeout(1)
         s.bind(("0.0.0.0", LOCAL_PORT))
         s.listen(5)
@@ -204,13 +319,17 @@ def receive_server(stop_event):
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"Server error: {e}")
+                if not stop_event.is_set():
+                    print(f"Server error: {e}")
 
 def full_sync(stop_event):
     while not stop_event.is_set():
         time.sleep(SYNC_INTERVAL)
-        handler = SyncHandler()
-        handler.sync_directory(WATCH_FOLDER)
+        try:
+            handler = SyncHandler()
+            handler.sync_directory(WATCH_FOLDER)
+        except Exception as e:
+            print(f"Full sync error: {e}")
 
 class FileSyncService(win32serviceutil.ServiceFramework):
     _svc_name_ = "FileSyncService"
@@ -238,7 +357,7 @@ class FileSyncService(win32serviceutil.ServiceFramework):
     def SvcDoRun(self):
         self.ReportServiceStatus(win32service.SERVICE_START_PENDING)
         try:
-            load_origins()
+            load_versions()
             self.start_service()
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             self.main_loop()
@@ -267,7 +386,7 @@ class FileSyncService(win32serviceutil.ServiceFramework):
             time.sleep(1)
 
 def run_as_console():
-    load_origins()
+    load_versions()
     stop_event = threading.Event()
     
     # Start all components
@@ -292,7 +411,7 @@ def run_as_console():
         stop_event.set()
         observer.stop()
         observer.join()
-        save_origins()
+        save_versions()
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:

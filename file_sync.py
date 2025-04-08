@@ -29,10 +29,11 @@ BLOCK_SIZE = 128 * 1024  # 128KB blocks
 MAX_CONNECTION_ATTEMPTS = 5
 DEVICE_ID = str(uuid.uuid4())  # Unique identifier for this device
 LOCAL_CHANGE_EXPIRE = 10  # Seconds to remember local changes
+VERSION_FILE = ".sync_versions.json"
 
 # Track file versions and origins
 file_versions = defaultdict(dict)
-version_file = os.path.join(WATCH_FOLDER, ".sync_versions.json")
+version_file_path = os.path.join(WATCH_FOLDER, VERSION_FILE)
 
 def get_file_content_hash(filepath):
     """Generate SHA-256 hash of the entire file content"""
@@ -48,11 +49,38 @@ def get_file_content_hash(filepath):
             sha256.update(block)
     return sha256.hexdigest()
 
+def get_directory_hash(dirpath):
+    """Generate a hash representing the directory's contents and structure"""
+    if not os.path.isdir(dirpath):
+        return None
+    
+    sha256 = hashlib.sha256()
+    for root, dirs, files in os.walk(dirpath, topdown=True):
+        # Sort to ensure consistent ordering
+        dirs.sort()
+        files.sort()
+        
+        # Include directory names in hash
+        for dirname in dirs:
+            full_path = os.path.join(root, dirname)
+            stat = os.stat(full_path)
+            sha256.update(f"{full_path}:{stat.st_mtime_ns}".encode('utf-8'))
+        
+        # Include file metadata in hash
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            if os.path.basename(full_path) == VERSION_FILE:
+                continue  # Skip version file
+            stat = os.stat(full_path)
+            sha256.update(f"{full_path}:{stat.st_size}:{stat.st_mtime_ns}".encode('utf-8'))
+    
+    return sha256.hexdigest()
+
 def load_versions():
     global file_versions
     try:
-        if os.path.exists(version_file):
-            with open(version_file, 'r', encoding='utf-8') as f:
+        if os.path.exists(version_file_path):
+            with open(version_file_path, 'r', encoding='utf-8') as f:
                 file_versions = json.load(f)
     except Exception as e:
         print(f"Error loading versions: {e}")
@@ -60,10 +88,16 @@ def load_versions():
 
 def save_versions():
     try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tf:
+        # Create temp file outside watched folder to avoid triggering sync
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=tempfile.gettempdir()) as tf:
             json.dump(file_versions, tf)
+        
+        # Mark version file update as local change to prevent echo
+        handler = SyncHandler()
+        handler.mark_local_change(version_file_path)
+        
         # Atomic rename
-        os.replace(tf.name, version_file)
+        os.replace(tf.name, version_file_path)
     except Exception as e:
         print(f"Error saving versions: {e}")
 
@@ -83,7 +117,7 @@ def get_file_blocks(filepath):
     return block_hashes
 
 def get_file_version(filepath):
-    """Generate a version vector for the file"""
+    """Generate a version vector for the file or directory"""
     if not os.path.exists(filepath):
         return None
         
@@ -91,7 +125,8 @@ def get_file_version(filepath):
         return {
             "type": "directory",
             "device": DEVICE_ID,
-            "version": time.time_ns()
+            "version": time.time_ns(),
+            "content_hash": get_directory_hash(filepath)
         }
         
     stat = os.stat(filepath)
@@ -113,14 +148,16 @@ def ensure_directory_exists(full_path):
 
 class SyncHandler(FileSystemEventHandler):
     def __init__(self):
-        self.ignore_patterns = ['.sync_versions.json']
+        self.ignore_patterns = [VERSION_FILE]
         self.last_sync = 0
         self.pending_changes = set()
         self.lock = threading.Lock()
         self.local_changes = {}  # Track changes we initiated locally {path: {hash, timestamp}}
 
     def should_ignore(self, path):
-        return any(ignore in path for ignore in self.ignore_patterns)
+        """Check if path should be ignored for sync"""
+        basename = os.path.basename(path)
+        return basename == VERSION_FILE or any(ignore in path for ignore in self.ignore_patterns)
 
     def on_modified(self, event):
         if not event.is_directory and not self.should_ignore(event.src_path):
@@ -129,7 +166,7 @@ class SyncHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not self.should_ignore(event.src_path):
             if event.is_directory:
-                self.sync_directory(event.src_path)
+                self.queue_change(event.src_path)
             else:
                 self.queue_change(event.src_path)
 
@@ -140,7 +177,7 @@ class SyncHandler(FileSystemEventHandler):
     def on_moved(self, event):
         if not self.should_ignore(event.dest_path):
             if event.is_directory:
-                self.sync_directory(event.dest_path)
+                self.queue_change(event.dest_path)
             else:
                 self.queue_change(event.dest_path)
             self.queue_delete(event.src_path)
@@ -170,7 +207,11 @@ class SyncHandler(FileSystemEventHandler):
     def mark_local_change(self, file_path):
         """Mark a file as changed locally to prevent echo"""
         with self.lock:
-            content_hash = get_file_content_hash(file_path) if os.path.isfile(file_path) else None
+            if os.path.isdir(file_path):
+                content_hash = get_directory_hash(file_path)
+            else:
+                content_hash = get_file_content_hash(file_path) if os.path.isfile(file_path) else None
+                
             self.local_changes[file_path] = {
                 'hash': content_hash,
                 'timestamp': time.time()
@@ -228,15 +269,20 @@ class SyncHandler(FileSystemEventHandler):
 
     def sync_directory(self, dir_path):
         """Sync an entire directory structure"""
+        # First sync the directory itself
+        rel_dir_path = os.path.relpath(dir_path, WATCH_FOLDER)
+        self._sync_directory_metadata(rel_dir_path)
+        
+        # Then sync its contents
         for root, dirs, files in os.walk(dir_path):
-            # First ensure all directories exist
+            # Sync subdirectories
             for dir_name in dirs:
                 full_dir_path = os.path.join(root, dir_name)
                 if not self.should_ignore(full_dir_path):
-                    rel_dir_path = os.path.relpath(full_dir_path, WATCH_FOLDER)
-                    self._sync_directory_metadata(rel_dir_path)
+                    rel_path = os.path.relpath(full_dir_path, WATCH_FOLDER)
+                    self._sync_directory_metadata(rel_path)
             
-            # Then sync all files
+            # Sync files
             for file in files:
                 file_path = os.path.join(root, file)
                 if not self.should_ignore(file_path):
@@ -245,15 +291,15 @@ class SyncHandler(FileSystemEventHandler):
     def _sync_directory_metadata(self, rel_dir_path):
         """Sync directory creation/metadata"""
         dir_key = f"{DEVICE_ID}:{rel_dir_path}"
-        current_version = {
-            "type": "directory",
-            "device": DEVICE_ID,
-            "version": time.time_ns()
-        }
+        full_dir_path = os.path.join(WATCH_FOLDER, rel_dir_path)
+        current_version = get_file_version(full_dir_path)
         
-        # Check if we already have the latest version
-        if dir_key in file_versions and file_versions[dir_key].get("version", 0) >= current_version["version"]:
-            return
+        # Check if we already have the latest version with same content
+        if dir_key in file_versions:
+            existing_version = file_versions[dir_key]
+            if (existing_version.get("version", 0) >= current_version["version"] and
+                existing_version.get("content_hash") == current_version.get("content_hash")):
+                return
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -272,7 +318,6 @@ class SyncHandler(FileSystemEventHandler):
                 save_versions()
                 
                 # Mark as local change to prevent echo
-                full_dir_path = os.path.join(WATCH_FOLDER, rel_dir_path)
                 self.mark_local_change(full_dir_path)
                 
         except Exception as e:
@@ -351,6 +396,8 @@ class SyncHandler(FileSystemEventHandler):
                 print(f"Error sending {file_name} (attempt {attempt}): {e}")
                 time.sleep(RETRY_DELAY * attempt)
         print(f"Failed to send {file_name} after {RETRY_COUNT} attempts")
+
+# [Rest of the original code remains the same...]
 
 def receive_connection(conn, addr):
     try:
